@@ -1,0 +1,381 @@
+import os
+from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory, session, jsonify
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your_secret_key_here'
+app.config['UPLOAD_FOLDER'] = os.path.join('static', 'uploaded_model')
+
+# Create the upload folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# ---------------------------------------------
+# Inline HTML Templates
+# ---------------------------------------------
+
+HOME_PAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Mr.Lee 2025 KIN217</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin: 30px;
+        }
+        h1 {
+            margin-bottom: 30px;
+        }
+        img {
+            margin-bottom: 30px;
+        }
+        form {
+            margin-bottom: 30px;
+        }
+        .btn {
+            padding: 10px 20px;
+            font-size: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>Mr.Lee 2025 KIN217</h1>
+    <!-- Image displayed below the title -->
+    <img
+        src="https://img.notionusercontent.com/s3/prod-files-secure%2Fc0e6362f-a01b-4344-9d63-1a34e2894f65%2F00cff07f-ed00-466b-a1be-53a39b5dcd81%2FKakaoTalk_20210307_222518304.png/size/w=250?exp=1736138998&sig=VL5G_ljrBiybshUqK1baYVY33qO-9l4xVtoAt4PGQIE"
+        alt="Movement Tracking Image"
+    />
+    <p>Upload a TensorFlow.js pose model (Teachable Machine) to begin.</p>
+    <form method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data">
+        <input type="file" name="modelFile" accept=".json,.js" required />
+        <button class="btn" type="submit">Upload Model</button>
+    </form>
+    <p>Once uploaded, you will be redirected to open your camera.</p>
+</body>
+</html>
+"""
+
+CAMERA_PAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Mr.Lee 2025 KIN217 - Camera</title>
+    <style>
+        body {
+            margin: 0; 
+            padding: 0; 
+            font-family: Arial, sans-serif;
+            display: flex; 
+            flex-direction: column; 
+            align-items: center;
+            justify-content: flex-start; 
+        }
+        h1 {
+            margin-top: 20px;
+        }
+        #camera-buttons {
+            margin-top: 10px;
+        }
+        #camera-container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            margin-top: 20px;
+        }
+        video {
+            width: 640px;
+            height: 480px;
+            background: #333;
+        }
+        #countdown {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            font-size: 2em;
+            color: #FF0000;
+            font-weight: bold;
+            text-shadow: 1px 1px #000;
+        }
+        #percentage {
+            position: absolute;
+            top: 60px;
+            left: 10px;
+            font-size: 1.5em;
+            color: #00FF00;
+            font-weight: bold;
+            text-shadow: 1px 1px #000;
+        }
+        .btn {
+            padding: 10px 20px; 
+            font-size: 1rem; 
+            margin: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Mr.Lee 2025 KIN217 - Camera</h1>
+    <div id="camera-buttons">
+      <!-- Back button to go to the homepage -->
+      <button class="btn" onclick="window.location.href='/'">Back</button>
+      <button class="btn" id="openCameraButton">Open the camera</button>
+    </div>
+    <div id="camera-container">
+        <video id="camera" autoplay muted playsinline></video>
+        <div id="countdown"></div>
+        <div id="percentage"></div>
+    </div>
+    <div>
+      <button class="btn" id="startTaskButton">Task Start</button>
+      <button class="btn" id="stopTaskButton">Task Stop</button>
+    </div>
+
+    <!-- TensorFlow.js (Must load TF.js for model usage) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+
+    <!-- The user’s uploaded model (example). Adjust if multiple files. -->
+    {% if model_file_name %}
+    <script src="{{ url_for('static', filename='uploaded_model/' + model_file_name) }}"></script>
+    {% endif %}
+
+    <script>
+        const openCameraButton = document.getElementById('openCameraButton');
+        const startTaskButton = document.getElementById('startTaskButton');
+        const stopTaskButton = document.getElementById('stopTaskButton');
+        const videoElement = document.getElementById('camera');
+        const countdownElem = document.getElementById('countdown');
+        const percentageElem = document.getElementById('percentage');
+
+        let stream = null;
+        let countdownInterval = null;
+        let count = 5;
+
+        // Track how many seconds we detect each class (mock logic)
+        let class1Seconds = 0;
+        let class2Seconds = 0;
+
+        // We still track sums and counts to calculate the average behind the scenes
+        let class1SumPercent = 0;
+        let class1Count = 0;
+        let class2SumPercent = 0;
+        let class2Count = 0;
+
+        let mockInterval = null;
+
+        // Initially disable "Task Stop"
+        stopTaskButton.disabled = true;
+
+        // Request camera access
+        openCameraButton.addEventListener('click', async () => {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                videoElement.srcObject = stream;
+            } catch (error) {
+                alert("Unable to access camera. Please allow camera permissions.");
+                console.error(error);
+            }
+        });
+
+        // Start the task: 5-second countdown, then mock inference
+        startTaskButton.addEventListener('click', () => {
+            // Disable start, enable stop
+            startTaskButton.disabled = true;
+            stopTaskButton.disabled = false;
+
+            // Reset counters
+            count = 5;
+            class1Seconds = 0;
+            class2Seconds = 0;
+            class1SumPercent = 0;
+            class1Count = 0;
+            class2SumPercent = 0;
+            class2Count = 0;
+
+            countdownElem.textContent = count;
+            percentageElem.textContent = "";
+
+            // 5-second countdown
+            countdownInterval = setInterval(() => {
+                count--;
+                if (count > 0) {
+                    countdownElem.textContent = count;
+                } else {
+                    clearInterval(countdownInterval);
+                    countdownElem.textContent = "";
+                    startInference();
+                }
+            }, 1000);
+        });
+
+        // Stop the task: end inference and go to summary
+        stopTaskButton.addEventListener('click', () => {
+            if (mockInterval) {
+                clearInterval(mockInterval);
+            }
+            startTaskButton.disabled = false;
+            stopTaskButton.disabled = true;
+            submitSummary();
+        });
+
+        // Mock real-time inference: randomly pick class & percentage each second
+        function startInference() {
+            mockInterval = setInterval(() => {
+                const randomClass = Math.random() < 0.5 ? 'class1' : 'class2';
+                const mockPercentage = Math.floor(Math.random() * 100) + 1; // 1-100%
+
+                if (randomClass === 'class1') {
+                    class1Seconds++;
+                    class1SumPercent += mockPercentage;
+                    class1Count++;
+                    // Removed average from display here:
+                    percentageElem.textContent = 
+                      `Matched Class 1 (${mockPercentage}%) - total: ${class1Seconds}s`;
+                } else {
+                    class2Seconds++;
+                    class2SumPercent += mockPercentage;
+                    class2Count++;
+                    // Removed average from display here:
+                    percentageElem.textContent = 
+                      `Matched Class 2 (${mockPercentage}%) - total: ${class2Seconds}s`;
+                }
+            }, 1000);
+        }
+
+        // Send summary (including average) to store on server
+        function submitSummary() {
+            let class1Avg = class1Count > 0 ? (class1SumPercent / class1Count).toFixed(1) : 0;
+            let class2Avg = class2Count > 0 ? (class2SumPercent / class2Count).toFixed(1) : 0;
+
+            const data = {
+                class1Time: class1Seconds,
+                class2Time: class2Seconds,
+                class1Avg: class1Avg,
+                class2Avg: class2Avg
+            };
+            fetch('/store_summary', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(result => {
+                window.location.href = '/summary';
+            })
+            .catch(err => console.error(err));
+        }
+    </script>
+</body>
+</html>
+"""
+
+SUMMARY_PAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Mr.Lee 2025 KIN217 - Summary</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            text-align: center; 
+            margin: 30px; 
+        }
+        h1 { margin-bottom: 20px; }
+        .btn { padding: 10px 20px; font-size: 1rem; }
+        .results-container {
+            display: inline-block;
+            text-align: left;
+            margin-top: 20px;
+        }
+        .results-container p {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Task Summary</h1>
+    <div class="results-container">
+        <p><strong>Class 1 time:</strong> {{ class1_time }} seconds</p>
+        <p><strong>Class 1 average %:</strong> {{ class1_avg }}%</p>
+        <br/>
+        <p><strong>Class 2 time:</strong> {{ class2_time }} seconds</p>
+        <p><strong>Class 2 average %:</strong> {{ class2_avg }}%</p>
+    </div>
+    <br/><br/>
+    <button class="btn" onclick="window.location.href='/'">Home</button>
+</body>
+</html>
+"""
+
+# ---------------------------------------------
+# Flask Routes
+# ---------------------------------------------
+
+@app.route("/", methods=["GET"])
+def home():
+    """Show the home page with the file upload form."""
+    return render_template_string(HOME_PAGE_HTML)
+
+@app.route("/", methods=["POST"])
+def upload_file():
+    """Handle the model file upload and redirect to the camera page."""
+    if 'modelFile' not in request.files:
+        return "No file part in request.", 400
+    
+    file = request.files['modelFile']
+    if file.filename == '':
+        return "No file selected.", 400
+
+    filename = secure_filename(file.filename)
+    save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(save_path)
+    return redirect(url_for('camera', model_file_name=filename))
+
+@app.route("/camera", methods=["GET"])
+def camera():
+    """Show the camera page with Back, Open Camera, Task Start, and Task Stop buttons."""
+    model_file_name = request.args.get('model_file_name', default=None)
+    return render_template_string(CAMERA_PAGE_HTML, model_file_name=model_file_name)
+
+@app.route("/store_summary", methods=["POST"])
+def store_summary():
+    """
+    Receive summary data (class1Time, class2Time, class1Avg, class2Avg) from the client,
+    store in session, and return JSON response.
+    """
+    data = request.get_json()
+    session['summary'] = data
+    return jsonify({"message": "Summary stored"})
+
+@app.route("/summary", methods=["GET"])
+def summary():
+    """Display the summary page with total time and average percentages for each class."""
+    summary_data = session.get('summary', {})
+    class1_time = summary_data.get('class1Time', 0)
+    class2_time = summary_data.get('class2Time', 0)
+    class1_avg = summary_data.get('class1Avg', 0)
+    class2_avg = summary_data.get('class2Avg', 0)
+
+    return render_template_string(
+        SUMMARY_PAGE_HTML,
+        class1_time=class1_time,
+        class1_avg=class1_avg,
+        class2_time=class2_time,
+        class2_avg=class2_avg
+    )
+
+# Serve uploaded model files from the static folder
+@app.route('/static/uploaded_model/<path:filename>')
+def uploaded_model_files(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# ---------------------------------------------
+# Run the Flask app
+# ---------------------------------------------
+if __name__ == "__main__":
+    # For Replit, typically 'host=0.0.0.0', port=8080
+    app.run(host="0.0.0.0", port=8080, debug=True)
